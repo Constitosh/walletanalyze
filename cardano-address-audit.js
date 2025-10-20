@@ -6,13 +6,6 @@
  *
  * Installs:
  *   npm i axios dotenv
- *
- * What it does:
- *   - fetches all tx hashes for the address (paged)
- *   - for each tx fetches /txs/{hash}/utxos and /txs/{hash}
- *   - sums lovelace received (outputs to address) and spent (inputs from address)
- *   - attributes tx fee proportionally to inputs from the address
- *   - counts outgoing txs that included multiassets (non-lovelace units) in inputs from the address
  */
 
 import axios from 'axios';
@@ -35,21 +28,21 @@ const client = axios.create({
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+// (kept for completeness if you ever need it)
 function lovelaceToAda(lovelaceStr) {
-  // Blockfrost returns strings for big numbers
   return Number(BigInt(lovelaceStr) / 1000000n) + Number((BigInt(lovelaceStr) % 1000000n)) / 1e6;
 }
 
+// 1) Defensive helper for extracting lovelace from an amount array
 function sumLovelaceAmount(arr) {
-  // arr: array of { unit, quantity }
-  // find unit === 'lovelace'
-  const item = arr.find((a) => a.unit === 'lovelace');
-  if (!item) return 0n;
+  if (!Array.isArray(arr)) return 0n;
+  const item = arr.find((a) => a && a.unit === 'lovelace');
+  if (!item || item.quantity == null) return 0n;
   return BigInt(item.quantity);
 }
 
 async function fetchAllTxsForAddress(address) {
-  const pageSize = 100; // max page size
+  const pageSize = 100;
   let page = 1;
   let txs = [];
   while (true) {
@@ -59,7 +52,6 @@ async function fetchAllTxsForAddress(address) {
     if (!Array.isArray(resp.data) || resp.data.length === 0) break;
     txs = txs.concat(resp.data.map((d) => d.tx_hash));
     page += 1;
-    // small delay to be polite
     await sleep(200);
   }
   return txs;
@@ -72,7 +64,7 @@ async function fetchTxUtxos(txhash) {
 
 async function fetchTxInfo(txhash) {
   const resp = await client.get(`/txs/${txhash}`);
-  return resp.data; // includes fee
+  return resp.data; // includes "fees" (plural)
 }
 
 // Main
@@ -106,31 +98,34 @@ async function fetchTxInfo(txhash) {
   for (const txhash of txHashes) {
     try {
       const utxos = await fetchTxUtxos(txhash);
-      // polite delay
       await sleep(200);
 
       const txinfo = await fetchTxInfo(txhash);
       await sleep(150);
 
-      const feeLovelace = BigInt(txinfo.fee);
+      // 2) Use "fees" (plural) + guard
+      const feeLovelace = BigInt(txinfo?.fees ?? 0);
+
+      // 3) Make loops resilient: normalize arrays before iterating
+      const inputs = Array.isArray(utxos?.inputs) ? utxos.inputs : [];
+      const outputs = Array.isArray(utxos?.outputs) ? utxos.outputs : [];
 
       // compute input lovelace total and lovelace from this address in inputs
       let totalInputsLovelace = 0n;
       let inputsFromAddressLovelace = 0n;
-      // also capture whether inputs from address include non-lovelace assets
       let inputsFromAddressHasAssets = false;
       const assetsMovedFromAddressThisTx = [];
 
-      for (const inp of utxos.inputs) {
-        const inpL = sumLovelaceAmount(inp.amount);
+      for (const inp of inputs) {
+        const inpL = sumLovelaceAmount(inp?.amount);
         totalInputsLovelace += inpL;
-        if (inp.address === address) {
+
+        if (inp?.address === address) {
           inputsFromAddressLovelace += inpL;
-          // detect non-lovelace units in this input
-          for (const a of inp.amount) {
-            if (a.unit !== 'lovelace') {
+          const amounts = Array.isArray(inp?.amount) ? inp.amount : [];
+          for (const a of amounts) {
+            if (a && a.unit && a.unit !== 'lovelace') {
               inputsFromAddressHasAssets = true;
-              // store asset unit
               assetsMovedFromAddressThisTx.push({ unit: a.unit, quantity: a.quantity });
               outgoingAssetsSet.add(a.unit);
             }
@@ -140,9 +135,9 @@ async function fetchTxInfo(txhash) {
 
       // compute outputs to the address (received)
       let outputsToAddressLovelace = 0n;
-      for (const out of utxos.outputs) {
-        if (out.address === address) {
-          outputsToAddressLovelace += sumLovelaceAmount(out.amount);
+      for (const out of outputs) {
+        if (out?.address === address) {
+          outputsToAddressLovelace += sumLovelaceAmount(out?.amount);
         }
       }
 
@@ -153,8 +148,6 @@ async function fetchTxInfo(txhash) {
       // attribute fee proportionally (estimate)
       let feeAttributedToThisAddress = 0n;
       if (inputsFromAddressLovelace > 0n && totalInputsLovelace > 0n) {
-        // fee * (inputsFromAddressLovelace / totalInputsLovelace)
-        // to keep as integer: (fee * inputsFromAddressLovelace) / totalInputsLovelace
         feeAttributedToThisAddress = (feeLovelace * inputsFromAddressLovelace) / totalInputsLovelace;
         totalFeesAttributed += feeAttributedToThisAddress;
       }
@@ -174,11 +167,9 @@ async function fetchTxInfo(txhash) {
 
     } catch (err) {
       console.warn(`Warning: failed to fetch/process tx ${txhash}: ${err?.response?.status} ${err?.response?.data || err?.message}`);
-      // continue with others
     }
   }
 
-  // Build final numbers (ADA conversion)
   const totalReceivedAda = Number(totalReceivedLovelace) / 1e6;
   const totalSpentAda = Number(totalSpentLovelace) / 1e6;
   const totalFeesAttributedAda = Number(totalFeesAttributed) / 1e6;
@@ -201,10 +192,12 @@ async function fetchTxInfo(txhash) {
   console.log("\n===== SUMMARY =====");
   console.log(JSON.stringify(summary, null, 2));
 
-  // Optionally write per-tx details to a JSON file
-  // If you want, you can write to disk: uncomment below
+  // Optional: write detailed JSON
   // import fs from 'fs';
-  // fs.writeFileSync(`audit_${address.replace(/[^a-z0-9]/gi,'')}.json`, JSON.stringify({ summary, perTxSummary }, null, 2));
+  // fs.writeFileSync(
+  //   `audit_${address.replace(/[^a-z0-9]/gi,'')}.json`,
+  //   JSON.stringify({ summary, perTxSummary }, null, 2)
+  // );
 
   console.log("\nDone.");
 })();
